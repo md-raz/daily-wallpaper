@@ -3,7 +3,7 @@ name: Build and Deploy Wallpaper
 on:
   workflow_dispatch:
   schedule:
-    # Runs daily at 09:10 UTC (adjust later if you care)
+    # Runs daily at 09:10 UTC
     - cron: "10 9 * * *"
 
 permissions:
