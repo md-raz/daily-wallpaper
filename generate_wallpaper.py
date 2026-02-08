@@ -19,13 +19,13 @@ class Style:
     height: int = 2796
 
     # Placement: keep grid below the clock
-    top_offset: int = 520  # tweak this until it sits where you want
-    left_margin: int = 80  # tweak for horizontal centering
+    top_offset: int = 800  # tweak this until it sits where you want
+    left_margin: int = 0  # tweak for horizontal centering
 
     # Circle geometry
-    radius: int = 12
-    col_gap: int = 24        # space between columns (in pixels, between circle bounding boxes)
-    row_gap: int = 10        # space between circles vertically
+    radius: int = 20
+    col_gap: int =40        # space between columns (in pixels, between circle bounding boxes)
+    row_gap: int = 12        # space between circles vertically
 
     # Colors (RGB)
     bg: tuple[int, int, int] = (0, 0, 0)
