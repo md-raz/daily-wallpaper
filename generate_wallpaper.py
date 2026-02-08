@@ -19,7 +19,7 @@ class Style:
     height: int = 2796
 
     # Placement: keep grid below the clock
-    top_offset: int = 800  # tweak this until it sits where you want
+    top_offset: int = 750  # tweak this until it sits where you want
     left_margin: int = 0  # tweak for horizontal centering
 
     # Circle geometry
