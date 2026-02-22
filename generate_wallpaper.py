@@ -10,7 +10,7 @@ Architecture:
     Palette        - 4-color scheme (bg, past, today, future)
     PaletteFactory - generates random harmonious palettes
     LayoutEngine   - computes dot grid positions respecting safe zones
-    Renderer       - draws the wallpaper image
+    Renderer       - draws the wallpaper image (with day-of-week labels)
     main()         - orchestrates everything + exports
 """
 
@@ -21,18 +21,64 @@ import colorsys
 import json
 import random
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
 from typing import Tuple
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 # ─────────────────────────── Types ────────────────────────────
 
 Color = Tuple[int, int, int]
 ColorRGBA = Tuple[int, int, int, int]
 Bounds = Tuple[int, int, int, int]  # left, top, right, bottom
+
+
+# ─────────────────────────── Color Utilities ──────────────────
+
+def _hsl_to_rgb(h: float, s: float, l: float) -> Color:
+    """
+    Convert HSL to RGB tuple.
+
+    Args:
+        h: Hue in [0, 360)
+        s: Saturation in [0, 1]
+        l: Lightness in [0, 1]
+
+    Returns:
+        (R, G, B) each in [0, 255]
+    """
+    # colorsys uses HLS order and hue in [0, 1]
+    r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _wrap_hue(h: float) -> float:
+    """Wrap hue to [0, 360)."""
+    return h % 360
+
+
+def _luminance(c: Color) -> float:
+    """
+    Relative luminance per ITU-R BT.709.
+
+    Used to decide whether to overlay white or dark text on a colored dot.
+    BT.709 weights (0.2126 R, 0.7152 G, 0.0722 B) reflect human perception
+    far better than a naive average — green appears much brighter than red
+    or blue at the same intensity.
+    """
+    r, g, b = c[0] / 255.0, c[1] / 255.0, c[2] / 255.0
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _text_color_for_bg(bg: Color) -> Color:
+    """Pick white or near-black text for legibility against the dot color."""
+    return (20, 20, 20) if _luminance(bg) > 0.4 else (240, 240, 240)
 
 
 # ─────────────────────────── Device Profiles ──────────────────
@@ -77,9 +123,6 @@ class DeviceProfile:
 
 
 # Target devices.
-# Safe zone values are in physical pixels at the native resolution.
-# Top safe zone keeps the grid below the lock screen clock + date.
-# Bottom safe zone avoids the flashlight/camera buttons + home indicator.
 DEVICE_STANDARD = DeviceProfile(
     name="iPhone 13 Pro",
     width=1170,
@@ -98,11 +141,11 @@ DEVICE_MAX = DeviceProfile(
 
 class HarmonyType(Enum):
     """Color harmony strategies from color theory."""
-    ANALOGOUS = auto()        # Hues within ~30° — calm, cohesive
-    COMPLEMENTARY = auto()    # Hues ~180° apart — vibrant contrast
-    SPLIT_COMPLEMENTARY = auto()  # Base + two hues flanking complement
-    TRIADIC = auto()          # Three hues equally spaced at 120°
-    MONOCHROMATIC = auto()    # Single hue, varied saturation/lightness
+    ANALOGOUS = auto()
+    COMPLEMENTARY = auto()
+    SPLIT_COMPLEMENTARY = auto()
+    TRIADIC = auto()
+    MONOCHROMATIC = auto()
 
 
 @dataclass(frozen=True)
@@ -140,40 +183,9 @@ class Palette:
         }
 
 
-def _hsl_to_rgb(h: float, s: float, l: float) -> Color:
-    """
-    Convert HSL to RGB tuple.
-
-    Args:
-        h: Hue in [0, 360)
-        s: Saturation in [0, 1]
-        l: Lightness in [0, 1]
-
-    Returns:
-        (R, G, B) each in [0, 255]
-    """
-    # colorsys uses HLS order and hue in [0, 1]
-    r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)
-    return (int(r * 255), int(g * 255), int(b * 255))
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def _wrap_hue(h: float) -> float:
-    """Wrap hue to [0, 360)."""
-    return h % 360
-
-
 class PaletteFactory:
     """
     Generates random, tasteful 4-color palettes using HSL color theory.
-
-    Design rationale — why HSL-based generation over a fixed list:
-      - Fixed lists cycle predictably (N palettes → repeat every N days).
-      - HSL constraints guarantee dark BG + readable dots algorithmically.
-      - Different harmony types keep things visually interesting day to day.
 
     Each harmony type constrains hue relationships while saturation and
     lightness are bounded to ensure:
@@ -183,15 +195,14 @@ class PaletteFactory:
       - "Today" dot is the most saturated/vivid element
     """
 
-    # Lightness and saturation constraints
-    BG_LIGHTNESS = (0.04, 0.10)       # Very dark backgrounds
-    BG_SATURATION = (0.20, 0.50)      # Slight color tint in BG
-    PAST_LIGHTNESS = (0.70, 0.85)     # Light but not washed out
-    PAST_SATURATION = (0.35, 0.65)    # Muted, not garish
-    TODAY_LIGHTNESS = (0.50, 0.65)    # Medium — vivid range
-    TODAY_SATURATION = (0.70, 0.95)   # High saturation accent
-    FUTURE_LIGHTNESS = (0.20, 0.28)   # Just above background
-    FUTURE_SATURATION = (0.08, 0.20)  # Nearly neutral
+    BG_LIGHTNESS = (0.04, 0.10)
+    BG_SATURATION = (0.20, 0.50)
+    PAST_LIGHTNESS = (0.70, 0.85)
+    PAST_SATURATION = (0.35, 0.65)
+    TODAY_LIGHTNESS = (0.50, 0.65)
+    TODAY_SATURATION = (0.70, 0.95)
+    FUTURE_LIGHTNESS = (0.20, 0.28)
+    FUTURE_SATURATION = (0.08, 0.20)
 
     HARMONY_WEIGHTS = {
         HarmonyType.ANALOGOUS: 3,
@@ -203,7 +214,6 @@ class PaletteFactory:
 
     @classmethod
     def generate(cls) -> Palette:
-        """Generate a random tasteful palette."""
         harmony = cls._pick_harmony()
         base_hue = random.uniform(0, 360)
         builder = {
@@ -225,7 +235,6 @@ class PaletteFactory:
     def _make_color(
         cls, hue: float, sat_range: Tuple[float, float], lit_range: Tuple[float, float]
     ) -> Color:
-        """Generate an RGB color within the given HSL bounds."""
         s = random.uniform(*sat_range)
         l = random.uniform(*lit_range)
         return _hsl_to_rgb(_wrap_hue(hue), s, l)
@@ -248,28 +257,17 @@ class PaletteFactory:
 
     @classmethod
     def _analogous(cls, base_hue: float, harmony: HarmonyType) -> Palette:
-        """Hues within ±30° — calm, cohesive feel."""
         offset = random.uniform(15, 35)
-        bg_hue = base_hue
-        past_hue = _wrap_hue(base_hue + offset)
-        today_hue = _wrap_hue(base_hue - offset)
-        future_hue = base_hue
-
         return Palette(
             name=f"analogous_{int(base_hue)}",
-            bg=cls._make_bg(bg_hue),
-            past=cls._make_past(past_hue),
-            today=cls._make_today(today_hue),
-            future=cls._make_future(future_hue),
+            bg=cls._make_bg(base_hue),
+            past=cls._make_past(_wrap_hue(base_hue + offset)),
+            today=cls._make_today(_wrap_hue(base_hue - offset)),
+            future=cls._make_future(base_hue),
         )
 
     @classmethod
     def _complementary(cls, base_hue: float, harmony: HarmonyType) -> Palette:
-        """
-        Base hue + 180° complement.
-        BG and future use base hue; past and today use the complement
-        for strong contrast.
-        """
         comp_hue = _wrap_hue(base_hue + 180)
         return Palette(
             name=f"complementary_{int(base_hue)}",
@@ -281,10 +279,6 @@ class PaletteFactory:
 
     @classmethod
     def _split_complementary(cls, base_hue: float, harmony: HarmonyType) -> Palette:
-        """
-        Base hue + two hues flanking the complement (±30° from 180°).
-        Gives contrast without the harshness of direct complementary.
-        """
         split_a = _wrap_hue(base_hue + 150)
         split_b = _wrap_hue(base_hue + 210)
         return Palette(
@@ -297,10 +291,6 @@ class PaletteFactory:
 
     @classmethod
     def _triadic(cls, base_hue: float, harmony: HarmonyType) -> Palette:
-        """
-        Three equally spaced hues at 120° intervals.
-        Bold and colorful — used less frequently (lower weight).
-        """
         hue_b = _wrap_hue(base_hue + 120)
         hue_c = _wrap_hue(base_hue + 240)
         return Palette(
@@ -313,10 +303,6 @@ class PaletteFactory:
 
     @classmethod
     def _monochromatic(cls, base_hue: float, harmony: HarmonyType) -> Palette:
-        """
-        Single hue, all variation comes from saturation and lightness.
-        Very cohesive, elegant, never clashes.
-        """
         return Palette(
             name=f"monochromatic_{int(base_hue)}",
             bg=cls._make_bg(base_hue),
@@ -333,37 +319,34 @@ class GridConfig:
     """
     Computed layout for the dot grid.
 
-    Design decision — why compute grid params from the content area
-    rather than using fixed pixel values:
-      The same code must produce good results on 750px (SE) through
-      1320px (16 Pro Max) widths. Deriving circle size and spacing
-      from the available area means we don't need per-device magic
-      numbers.
+    Derived from the content area so the same code works across
+    750px (SE) through 1320px (16 Pro Max) widths without
+    per-device magic numbers.
     """
-    cols: int           # Always 12 (months)
-    max_rows: int       # Max days in any month (31)
-    origin_x: int       # Left edge of first circle center
-    origin_y: int       # Top edge of first circle center
-    step_x: int         # Horizontal spacing between circle centers
-    step_y: int         # Vertical spacing between circle centers
-    radius: int         # Circle radius
-    island_bounds: Bounds  # Glass island bounding box
+    cols: int
+    max_rows: int
+    origin_x: int
+    origin_y: int
+    step_x: int
+    step_y: int
+    radius: int
+    island_bounds: Bounds
 
 
 class LayoutEngine:
     """
     Computes dot grid geometry to fit within the device's content area.
 
-    The grid has 12 columns (months) and up to 31 rows (days).
-    Circles are sized to fill the available width with even spacing,
-    capped at a maximum radius to prevent huge dots on large screens.
+    12 columns (months) × up to 31 rows (days). Circles are sized
+    to fill available width with even spacing, capped to prevent
+    oversized dots on large screens.
     """
 
-    MAX_RADIUS = 22         # Cap to prevent oversized dots
-    MIN_RADIUS = 10         # Floor for readability
-    COL_GAP_RATIO = 1.8     # Gap between columns = radius * this
-    ROW_GAP_RATIO = 0.6     # Gap between rows = radius * this
-    ISLAND_PADDING = 40     # Padding inside the glass island
+    MAX_RADIUS = 22
+    MIN_RADIUS = 10
+    COL_GAP_RATIO = 1.8
+    ROW_GAP_RATIO = 0.6
+    ISLAND_PADDING = 40
 
     @classmethod
     def compute(cls, device: DeviceProfile, year: int) -> GridConfig:
@@ -373,15 +356,9 @@ class LayoutEngine:
 
         max_days = max(calendar.monthrange(year, m)[1] for m in range(1, 13))
 
-        # Solve for radius from available width:
-        # total_width = 12 * 2r + 11 * (r * COL_GAP_RATIO)
-        # total_width = r * (24 + 11 * COL_GAP_RATIO)
         divisor = 24 + 11 * cls.COL_GAP_RATIO
         radius_from_width = int(content_width / divisor)
 
-        # Also constrain by height:
-        # total_height = max_days * (2r + r * ROW_GAP_RATIO)
-        # total_height = max_days * r * (2 + ROW_GAP_RATIO)
         row_divisor = max_days * (2 + cls.ROW_GAP_RATIO)
         radius_from_height = int(content_height / row_divisor)
 
@@ -394,14 +371,11 @@ class LayoutEngine:
         step_x = diam + col_gap
         step_y = diam + row_gap
 
-        # Center the grid horizontally in the content area
         total_grid_width = 12 * diam + 11 * col_gap
         origin_x = left + (content_width - total_grid_width) // 2 + radius
 
-        # Position grid at top of content area
         origin_y = top + radius
 
-        # Glass island bounds
         pad = cls.ISLAND_PADDING
         island_left = origin_x - radius - pad
         island_top = origin_y - radius - pad
@@ -420,16 +394,63 @@ class LayoutEngine:
         )
 
 
+# ─────────────────────────── Day-of-Week Labels ──────────────
+
+# datetime.weekday(): Mon=0 .. Sun=6
+DAY_LETTERS = ["M", "T", "W", "T", "F", "S", "S"]
+
+
+def _build_label_map(year: int, month: int, day: int) -> dict[tuple[int, int], str]:
+    """
+    Build a mapping of (month, day) → weekday letter for the 7 dots
+    centered on today.
+
+    Wrapping strategy:
+      Uses timedelta arithmetic on real date objects so month lengths,
+      leap years, and month boundaries are handled by the stdlib.
+      We then filter to dates within the same year — their month column
+      exists in the grid (1–12). The only dates that get clipped are
+      those that would fall in a different year:
+        - Jan 1–3: some preceding days land in the prior year's Dec
+        - Dec 29–31: some following days land in the next year's Jan
+
+      Cross-year wrapping IS possible (Dec's column exists when we're
+      in January, and vice versa) but is intentionally excluded because:
+        1. Those dots represent a *different* year's context. Labeling
+           Dec 31 of last year when viewing Jan 2 of this year would be
+           semantically misleading — the dot's past/future coloring is
+           relative to the current year.
+        2. It affects at most 3 days per year (Jan 1–3 and Dec 29–31),
+           so the visual impact is minimal.
+        3. Keeping the filter simple (same year only) avoids a class of
+           subtle bugs around year transitions.
+
+    Returns:
+        Dict mapping (month, day) → single letter string like "M", "W", etc.
+    """
+    today = date(year, month, day)
+    labels: dict[tuple[int, int], str] = {}
+
+    for offset in range(-3, 4):
+        d = today + timedelta(days=offset)
+        # Only label dots that belong to the current year's grid
+        if d.year == year:
+            letter = DAY_LETTERS[d.weekday()]
+            labels[(d.month, d.day)] = letter
+
+    return labels
+
+
 # ─────────────────────────── Renderer ─────────────────────────
 
 @dataclass(frozen=True)
 class GlassStyle:
     """Visual parameters for the glassmorphic island."""
     corner_radius: int = 50
-    fill_opacity: int = 25          # 0–255
-    border_opacity: int = 50        # 0–255
-    lighten_fill: int = 30          # How much to lighten BG for fill
-    lighten_border: int = 60        # How much to lighten BG for border
+    fill_opacity: int = 25
+    border_opacity: int = 50
+    lighten_fill: int = 30
+    lighten_border: int = 60
 
 
 class Renderer:
@@ -451,21 +472,29 @@ class Renderer:
         self.palette = palette
         self.grid = grid
         self.glass = glass or GlassStyle()
+        self._font = self._load_font(grid.radius)
+
+    @staticmethod
+    def _load_font(radius: int) -> ImageFont.FreeTypeFont:
+        """
+        Load a font sized proportionally to dot radius.
+        """
+        size = max(int(radius * 1.5), 12)
+        script_dir = Path(__file__).resolve().parent
+        font_paths = [
+            # script_dir / "fonts" / "NimbusSanL-BoldCondItal.ttf",
+            script_dir / "fonts" / "NimbusSanL-BoldCond.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for p in font_paths:
+            if Path(p).exists():
+                return ImageFont.truetype(str(p), size)
+        return ImageFont.load_default()
 
     def render(self, year: int, month: int, day: int) -> Image.Image:
-        """
-        Produce the final wallpaper image.
-
-        Args:
-            year:  Current year
-            month: Current month (1-12)
-            day:   Current day of month (1-31)
-
-        Returns:
-            PIL Image in RGB mode
-        """
+        """Produce the final wallpaper image."""
         img = Image.new("RGB", (self.device.width, self.device.height), self.palette.bg)
-
         img = self._draw_glass_island(img)
 
         draw = ImageDraw.Draw(img)
@@ -510,9 +539,18 @@ class Renderer:
     def _draw_dots(
         self, draw: ImageDraw.ImageDraw, year: int, month: int, day: int
     ) -> None:
-        """Draw 12 columns of dots, coloring by past/today/future."""
+        """
+        Draw 12 columns of dots, coloring by past/today/future.
+
+        Day-of-week letters are overlaid on the 7 dots centered on today,
+        wrapping into adjacent month columns when today is near a month
+        boundary. The label map is precomputed so this loop stays O(365).
+        """
         g = self.grid
         p = self.palette
+
+        # Precompute labels — may span up to 3 different months
+        labeled_days = _build_label_map(year, month, day)
 
         for m in range(1, 13):
             days_count = calendar.monthrange(year, m)[1]
@@ -521,6 +559,7 @@ class Renderer:
             for d in range(1, days_count + 1):
                 cy = g.origin_y + (d - 1) * g.step_y
 
+                # Determine dot color
                 if m < month or (m == month and d < day):
                     color = p.past
                 elif m == month and d == day:
@@ -528,10 +567,26 @@ class Renderer:
                 else:
                     color = p.future
 
+                # Draw the dot
                 draw.ellipse(
                     (cx - g.radius, cy - g.radius, cx + g.radius, cy + g.radius),
                     fill=color,
                 )
+
+                # Overlay day-of-week letter if this dot is labeled
+                letter = labeled_days.get((m, d))
+                if letter:
+                    text_color = _text_color_for_bg(color)
+                    bbox = self._font.getbbox(letter)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    # Center letter on the dot.
+                    # bbox[1] is the top bearing (often negative for ascent),
+                    # subtracting it corrects the vertical offset so the
+                    # glyph's visual center aligns with the dot's center.
+                    tx = cx - tw / 2
+                    ty = cy - th / 2 - bbox[1]
+                    draw.text((tx, ty), letter, fill=text_color, font=self._font)
 
 
 # ─────────────────────────── Export ───────────────────────────
@@ -562,7 +617,7 @@ def _render_for_device(
 def main() -> None:
     """
     Entry point. Generates three files in the output directory:
-      - latest.png      (iPhone 12 Pro)
+      - latest.png      (iPhone 13 Pro)
       - latest_max.png  (iPhone 16 Pro Max)
       - palette.json    (shared palette metadata)
     """
