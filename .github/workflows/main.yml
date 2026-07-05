@@ -3,7 +3,7 @@ name: Generate & Deploy Wallpaper
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 7 * * *"
+    - cron: "11 7 * * *"
 
 permissions:
   contents: read
